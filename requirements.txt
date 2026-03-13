@@ -1,4 +1,3 @@
 pandas
 sepaxml
 openpyxl
-streamlit
