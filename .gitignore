@@ -1,3 +1,5 @@
 /nutzungsentgelte.xlsx
 /sepa_transfer.xml
 /sepa_transfer_mieten.xml
+/__pycache__/
+/pages/__pycache__/
