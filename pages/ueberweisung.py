@@ -1,10 +1,12 @@
 from pathlib import Path
 import datetime as dt
+import re
 import xml.dom.minidom
 import xml.etree.ElementTree as ET
 
 import pandas as pd
 from sepaxml import SepaTransfer
+from sepaxml.validation import ValidationError
 import streamlit as st
 
 
@@ -14,6 +16,10 @@ NS = {"ns": "urn:iso:std:iso:20022:tech:xsd:pain.001.001.03"}
 
 class InputFileError(ValueError):
     pass
+
+
+IBAN_PATTERN = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$")
+BIC_PATTERN = re.compile(r"^[A-Z]{6}[A-Z2-9][A-NP-Z0-9]([A-Z0-9]{3})?$")
 
 
 def read_uploaded_workbook(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -85,14 +91,113 @@ def parse_batch(value) -> bool:
 
 
 def normalize_iban(value) -> str:
-    return str(value).replace(" ", "").strip()
+    return str(value).replace(" ", "").strip().upper()
 
 
 def normalize_bic(value) -> str | None:
     if pd.isna(value):
         return None
-    bic = str(value).replace(" ", "").strip()
+    bic = str(value).replace(" ", "").strip().upper()
     return bic or None
+
+
+def require_text(value, field_label: str, why: str, row_number: int | None = None) -> str:
+    if pd.isna(value) or not str(value).strip():
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(f"Das Feld `{field_label}` fehlt{location}. {why}")
+    return str(value).strip()
+
+
+def validate_iban(value, field_label: str, why: str, row_number: int | None = None) -> str:
+    iban = normalize_iban(value)
+    if not IBAN_PATTERN.fullmatch(iban):
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Die IBAN im Feld `{field_label}` ist{location} ungültig: `{value}`. {why}"
+        )
+    return iban
+
+
+def validate_bic(value, field_label: str, why: str, row_number: int | None = None) -> str | None:
+    bic = normalize_bic(value)
+    if bic is None:
+        return None
+    if not BIC_PATTERN.fullmatch(bic):
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Der BIC im Feld `{field_label}` ist{location} ungültig: `{value}`. {why}"
+        )
+    return bic
+
+
+def validate_amount(value, field_label: str, why: str, row_number: int | None = None) -> int:
+    try:
+        amount = float(value)
+    except Exception as exc:
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Der Betrag im Feld `{field_label}` ist{location} keine Zahl: `{value}`. {why}"
+        ) from exc
+    if amount <= 0:
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Der Betrag im Feld `{field_label}` muss{location} größer als 0 sein. {why}"
+        )
+    return int(round(amount * 100))
+
+
+def validate_date(value, field_label: str, why: str, row_number: int | None = None) -> dt.date:
+    try:
+        parsed = pd.to_datetime(value)
+    except Exception as exc:
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Das Datum im Feld `{field_label}` ist{location} ungültig: `{value}`. {why}"
+        ) from exc
+    if pd.isna(parsed):
+        location = f" in Zeile {row_number}" if row_number is not None else ""
+        raise InputFileError(
+            f"Das Datum im Feld `{field_label}` fehlt{location}. {why}"
+        )
+    return parsed.date()
+
+
+def format_schema_validation_error(exc: ValidationError) -> str:
+    cause = exc.__cause__
+    if cause is None:
+        return str(exc)
+
+    path = getattr(cause, "path", "") or ""
+    value = getattr(cause, "obj", None)
+    reason = getattr(cause, "reason", "") or ""
+
+    field_label = "ein Eingabefeld"
+    why = "Dieser Wert wird für eine gültige SEPA-Überweisungsdatei benötigt."
+    if path.endswith("/DbtrAgt/FinInstnId/BIC"):
+        field_label = "BIC des Auftraggebers"
+        why = "Der BIC identifiziert die Bank des Auftraggebers."
+    elif path.endswith("/CdtrAgt/FinInstnId/BIC"):
+        field_label = "BIC eines Zahlungsempfängers"
+        why = "Der BIC identifiziert die Bank des Zahlungsempfängers."
+    elif path.endswith("/DbtrAcct/Id/IBAN"):
+        field_label = "IBAN des Auftraggebers"
+        why = "Die IBAN legt fest, von welchem Konto überwiesen wird."
+    elif path.endswith("/CdtrAcct/Id/IBAN"):
+        field_label = "IBAN eines Zahlungsempfängers"
+        why = "Die IBAN legt fest, auf welches Konto überwiesen wird."
+    elif path.endswith("/ReqdExctnDt"):
+        field_label = "Ausführungsdatum"
+        why = "Die Bank braucht dieses Datum, um die Überweisung terminieren zu können."
+    elif path.endswith("/Ustrd"):
+        field_label = "Verwendungszweck"
+        why = "Der Verwendungszweck wird in die XML übernommen."
+    elif path.endswith("/Nm"):
+        field_label = "Name"
+        why = "Der Name wird in die XML für Auftraggeber oder Empfänger geschrieben."
+
+    value_text = f" Der problematische Wert ist `{value}`." if value not in (None, "") else ""
+    reason_text = f" Technischer Grund: {reason}" if reason else ""
+    return f"Ungültiger Wert im Feld {field_label}.{value_text} {why}{reason_text}"
 
 
 def compose_name(row: pd.Series) -> str:
@@ -163,13 +268,29 @@ def build_document(df_config: pd.DataFrame, df_payments: pd.DataFrame) -> tuple[
     validate_workbook(df_config, df_payments)
 
     config = {
-        "name": str(df_config.loc[0, "name"]).strip(),
-        "IBAN": normalize_iban(df_config.loc[0, "IBAN"]),
+        "name": require_text(
+            df_config.loc[0, "name"],
+            "name",
+            "Der Name wird als Auftraggeber in die XML geschrieben.",
+        ),
+        "IBAN": validate_iban(
+            df_config.loc[0, "IBAN"],
+            "IBAN",
+            "Diese IBAN ist nötig, damit die XML das belastete Konto eindeutig angibt.",
+        ),
         "batch": parse_batch(df_config.loc[0, "batch"]),
-        "currency": str(df_config.loc[0, "currency"]).strip(),
+        "currency": require_text(
+            df_config.loc[0, "currency"],
+            "currency",
+            "Die Währung wird für die Beträge in der XML benötigt.",
+        ),
     }
 
-    config_bic = normalize_bic(df_config.loc[0, "BIC"])
+    config_bic = validate_bic(
+        df_config.loc[0, "BIC"],
+        "BIC",
+        "Wenn ein BIC angegeben wird, muss er dem Bankformat entsprechen.",
+    )
     if config_bic:
         config["BIC"] = config_bic
 
@@ -177,17 +298,42 @@ def build_document(df_config: pd.DataFrame, df_payments: pd.DataFrame) -> tuple[
     preview_rows = []
 
     for row_number, (_, row) in enumerate(df_payments.iterrows(), start=1):
-        execution_date = to_date(row["execution_date"])
+        execution_date = validate_date(
+            row["execution_date"],
+            "execution_date",
+            "Das Ausführungsdatum legt fest, wann die Überweisung ausgeführt wird.",
+            row_number,
+        )
         payment = {
             "name": compose_name(row),
-            "IBAN": normalize_iban(row["IBAN"]),
-            "amount": to_cent_amount(row["amount"]),
+            "IBAN": validate_iban(
+                row["IBAN"],
+                "IBAN",
+                "Diese IBAN ist nötig, damit das Zielkonto eindeutig ist.",
+                row_number,
+            ),
+            "amount": validate_amount(
+                row["amount"],
+                "amount",
+                "Der Betrag ist nötig, damit die Überweisung korrekt erstellt wird.",
+                row_number,
+            ),
             "execution_date": execution_date,
-            "description": str(row["description"]).strip(),
+            "description": require_text(
+                row["description"],
+                "description",
+                "Der Verwendungszweck wird in die XML übernommen.",
+                row_number,
+            ),
             "endtoend_id": generate_endtoend_id(execution_date, row_number),
         }
 
-        payment_bic = normalize_bic(row.get("BIC"))
+        payment_bic = validate_bic(
+            row.get("BIC"),
+            "BIC",
+            "Wenn ein BIC angegeben wird, muss er dem Bankformat entsprechen.",
+            row_number,
+        )
         if payment_bic:
             payment["BIC"] = payment_bic
 
@@ -264,6 +410,8 @@ if uploaded_file is not None:
         st.code(format_xml(xml_content), language="xml")
     except InputFileError as exc:
         st.error(str(exc))
+    except ValidationError as exc:
+        st.error(format_schema_validation_error(exc))
     except Exception as exc:
         st.error(
             "Die Excel-Datei konnte nicht verarbeitet werden. "
