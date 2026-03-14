@@ -12,9 +12,68 @@ TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "dummy_ueberweisung.xlsx"
 NS = {"ns": "urn:iso:std:iso:20022:tech:xsd:pain.001.001.03"}
 
 
+class InputFileError(ValueError):
+    pass
+
+
 def read_uploaded_workbook(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    workbook = pd.read_excel(uploaded_file, sheet_name=["config", "payments"])
+    try:
+        workbook = pd.read_excel(uploaded_file, sheet_name=["config", "payments"])
+    except ValueError as exc:
+        raise InputFileError(
+            "Die Excel-Datei muss die Blätter `payments` und `config` enthalten. "
+            "Im Blatt `payments` stehen die einzelnen Überweisungen. Im Blatt `config` stehen die "
+            "Kontodaten des Auftraggebers."
+        ) from exc
     return workbook["config"], workbook["payments"]
+
+
+def validate_columns(df: pd.DataFrame, required_columns: dict[str, str], sheet_name: str) -> None:
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if not missing_columns:
+        return
+
+    details = " ".join(
+        f"`{column}`: {required_columns[column]}" for column in missing_columns
+    )
+    raise InputFileError(
+        f"Im Blatt `{sheet_name}` fehlen Pflichtspalten: {', '.join(f'`{column}`' for column in missing_columns)}. "
+        f"Diese Angaben werden zwingend erwartet. {details}"
+    )
+
+
+def validate_non_empty(df: pd.DataFrame, sheet_name: str) -> None:
+    if df.empty:
+        raise InputFileError(
+            f"Das Blatt `{sheet_name}` ist leer. Dort müssen Daten stehen, damit die App eine SEPA-Überweisungsdatei erzeugen kann."
+        )
+
+
+def validate_workbook(df_config: pd.DataFrame, df_payments: pd.DataFrame) -> None:
+    validate_non_empty(df_config, "config")
+    validate_non_empty(df_payments, "payments")
+    validate_columns(
+        df_config,
+        {
+            "name": "Der Name wird als Auftraggeber in die XML geschrieben.",
+            "IBAN": "Die IBAN legt fest, von welchem Konto überwiesen wird.",
+            "batch": "Diese Angabe steuert, ob die Überweisungen als Sammelbuchung geschrieben werden.",
+            "currency": "Die Währung wird für die Beträge in der XML benötigt.",
+        },
+        "config",
+    )
+    validate_columns(
+        df_payments,
+        {
+            "Vorname": "Vorname und Nachname werden zum Namen des Zahlungsempfängers zusammengesetzt.",
+            "Name": "Vorname und Nachname werden zum Namen des Zahlungsempfängers zusammengesetzt.",
+            "IBAN": "Die IBAN gibt das Zielkonto der Überweisung an.",
+            "amount": "Der Betrag legt fest, wie viel überwiesen wird.",
+            "execution_date": "Das Ausführungsdatum wird benötigt, weil die Bank wissen muss, wann die Überweisung ausgeführt werden soll.",
+            "description": "Der Verwendungszweck wird in die XML geschrieben.",
+        },
+        "payments",
+    )
 
 
 def parse_batch(value) -> bool:
@@ -101,6 +160,8 @@ def summarize_xml(xml_content: bytes) -> pd.DataFrame:
 
 
 def build_document(df_config: pd.DataFrame, df_payments: pd.DataFrame) -> tuple[bytes, pd.DataFrame]:
+    validate_workbook(df_config, df_payments)
+
     config = {
         "name": str(df_config.loc[0, "name"]).strip(),
         "IBAN": normalize_iban(df_config.loc[0, "IBAN"]),
@@ -201,5 +262,10 @@ if uploaded_file is not None:
         )
         st.subheader("SEPA XML Vorschau")
         st.code(format_xml(xml_content), language="xml")
+    except InputFileError as exc:
+        st.error(str(exc))
     except Exception as exc:
-        st.error(f"Fehler bei der Verarbeitung der Excel-Datei: {exc}")
+        st.error(
+            "Die Excel-Datei konnte nicht verarbeitet werden. "
+            f"Bitte prüfe insbesondere Datumswerte, Beträge und IBANs. Technischer Hinweis: {exc}"
+        )
